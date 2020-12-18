@@ -13,9 +13,9 @@ mod server_decode {
         let (mut client, server) = TestIO::new();
         client.write_all(s.as_bytes()).await?;
         client.close();
-        async_h1::server::decode(server)
+        Ok(async_h1::server::decode(server)
             .await
-            .map(|r| r.map(|(r, _)| r))
+            .map(|r| r.map(|(r, _)| r))?)
     }
 
     #[async_std::test]

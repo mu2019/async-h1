@@ -1,14 +1,16 @@
 //! Process HTTP connections on the server.
 
-use std::str::FromStr;
-
 use async_dup::{Arc, Mutex};
 use async_std::io::{BufReader, Read, Write};
 use async_std::{prelude::*, task};
-use http_types::content::ContentLength;
-use http_types::headers::{EXPECT, TRANSFER_ENCODING};
-use http_types::{ensure, ensure_eq, format_err};
-use http_types::{Body, Method, Request, Url};
+use http_types::{
+    content::ContentLength,
+    headers::{EXPECT, TRANSFER_ENCODING},
+    Version,
+};
+use http_types::{Body, Request, Url};
+
+use crate::{Error, Result};
 
 use super::body_reader::BodyReader;
 use crate::chunked::ChunkedDecoder;
@@ -17,14 +19,11 @@ use crate::{MAX_HEADERS, MAX_HEAD_LENGTH};
 
 const LF: u8 = b'\n';
 
-/// The number returned from httparse when the request is HTTP 1.1
-const HTTP_1_1_VERSION: u8 = 1;
-
 const CONTINUE_HEADER_VALUE: &str = "100-continue";
 const CONTINUE_RESPONSE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
 /// Decode an HTTP request on the server.
-pub async fn decode<IO>(mut io: IO) -> http_types::Result<Option<(Request, BodyReader<IO>)>>
+pub async fn decode<IO>(mut io: IO) -> Result<Option<(Request, BodyReader<IO>)>>
 where
     IO: Read + Write + Clone + Send + Sync + Unpin + 'static,
 {
@@ -42,10 +41,9 @@ where
         }
 
         // Prevent CWE-400 DDOS with large HTTP Headers.
-        ensure!(
-            buf.len() < MAX_HEAD_LENGTH,
-            "Head byte length should be less than 8kb"
-        );
+        if buf.len() >= MAX_HEAD_LENGTH {
+            return Err(Error::HeadersTooLong);
+        }
 
         // We've hit the end delimiter of the stream.
         let idx = buf.len() - 1;
@@ -57,44 +55,37 @@ where
     // Convert our header buf into an httparse instance, and validate.
     let status = httparse_req.parse(&buf)?;
 
-    ensure!(!status.is_partial(), "Malformed HTTP head");
+    if status.is_partial() {
+        return Err(Error::PartialHead);
+    }
 
-    // Convert httparse headers + body into a `http_types::Request` type.
-    let method = httparse_req.method;
-    let method = method.ok_or_else(|| format_err!("No method found"))?;
-
-    let version = httparse_req.version;
-    let version = version.ok_or_else(|| format_err!("No version found"))?;
-
-    ensure_eq!(
-        version,
-        HTTP_1_1_VERSION,
-        "Unsupported HTTP version 1.{}",
-        version
-    );
+    let method = httparse_req
+        .method
+        .ok_or(Error::MissingMethod)?
+        .parse()
+        .map_err(|_| Error::UnrecognizedMethod(httparse_req.method.unwrap().to_string()))?;
 
     let url = url_from_httparse_req(&httparse_req)?;
 
-    let mut req = Request::new(Method::from_str(method)?, url);
+    let mut req = Request::new(method, url);
 
-    req.set_version(Some(http_types::Version::Http1_1));
+    match httparse_req.version {
+        Some(1) => req.set_version(Some(Version::Http1_1)),
+        Some(version) => return Err(Error::UnsupportedVersion(version)),
+        None => return Err(Error::MissingVersion),
+    }
 
     for header in httparse_req.headers.iter() {
         req.append_header(header.name, std::str::from_utf8(header.value)?);
     }
 
-    let content_length = ContentLength::from_headers(&req)?;
+    let content_length =
+        ContentLength::from_headers(&req).map_err(|_| Error::MalformedHeader("content-length"))?;
     let transfer_encoding = req.header(TRANSFER_ENCODING);
 
-    // Return a 400 status if both Content-Length and Transfer-Encoding headers
-    // are set to prevent request smuggling attacks.
-    //
-    // https://tools.ietf.org/html/rfc7230#section-3.3.3
-    http_types::ensure_status!(
-        content_length.is_none() || transfer_encoding.is_none(),
-        400,
-        "Unexpected Content-Length header"
-    );
+    if content_length.is_some() && transfer_encoding.is_some() {
+        return Err(Error::UnexpectedHeader("content-length"));
+    }
 
     // Establish a channel to wait for the body to be read. This
     // allows us to avoid sending 100-continue in situations that
@@ -128,8 +119,8 @@ where
         let reader = BufReader::new(reader);
         req.set_body(Body::from_reader(reader, None));
         return Ok(Some((req, BodyReader::Chunked(reader_clone))));
-    } else if let Some(len) = content_length {
-        let len = len.len();
+    } else if let Some(content_length) = content_length {
+        let len = content_length.len();
         let reader = Arc::new(Mutex::new(reader.take(len)));
         req.set_body(Body::from_reader(
             BufReader::new(ReadNotifier::new(reader.clone(), body_read_sender)),
@@ -141,14 +132,14 @@ where
     }
 }
 
-fn url_from_httparse_req(req: &httparse::Request<'_, '_>) -> http_types::Result<Url> {
-    let path = req.path.ok_or_else(|| format_err!("No uri found"))?;
+fn url_from_httparse_req(req: &httparse::Request<'_, '_>) -> Result<Url> {
+    let path = req.path.ok_or(Error::RequestPathMissing)?;
 
     let host = req
         .headers
         .iter()
         .find(|x| x.name.eq_ignore_ascii_case("host"))
-        .ok_or_else(|| format_err!("Mandatory Host header missing"))?
+        .ok_or(Error::HostHeaderMissing)?
         .value;
 
     let host = std::str::from_utf8(host)?;
@@ -160,7 +151,7 @@ fn url_from_httparse_req(req: &httparse::Request<'_, '_>) -> http_types::Result<
     } else if req.method.unwrap().eq_ignore_ascii_case("connect") {
         Ok(Url::parse(&format!("http://{}/", path))?)
     } else {
-        Err(format_err!("unexpected uri format"))
+        Err(Error::UnexpectedURIFormat)
     }
 }
 
